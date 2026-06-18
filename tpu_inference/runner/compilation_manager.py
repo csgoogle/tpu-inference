@@ -264,6 +264,7 @@ class CompilationManager:
                     self._flush_compilations()
                 if self.runner.enable_continue_decode:
                     self._precompile_continue_decode()
+                    self._flush_compilations()
         finally:
             self._finalize_compilation()
         elapsed = time.perf_counter() - compilation_start_time
@@ -1165,11 +1166,13 @@ class CompilationManager:
                 self._run_compilation(
                     f"worker{self.runner.rank} extract_draft_token_ids",
                     self.runner._extract_draft_token_ids,
+                    self.runner,
                     input_ids,
                     final_logits_indices,
                     target_logits_indices,
                     num_tokens=num_tokens,
                     num_logits=num_logits,
+                    warmup_handler=self._skip_self_arg_warmup_handler,
                 )
 
     def _precompile_extract_last_sampled_tokens(self) -> None:
@@ -1740,6 +1743,11 @@ class CompilationManager:
                 self.runner.kv_caches = final_kv_caches
                 return generated_tokens
 
+            def continue_decode_warmup(_fn, _args, _call_kwargs):
+                new_args = list(_args)
+                new_args[7] = self.runner.kv_caches
+                return _fn(*new_args, **_call_kwargs)
+
             self._run_compilation(
                 f"worker{self.runner.rank} continue_decode_steps_{user_max_decode_steps}_reqs_{num_reqs}",
                 continue_decode_wrapper,
@@ -1764,4 +1772,5 @@ class CompilationManager:
                 self.runner.dp_size,
                 getattr(self.runner.vllm_config.model_config,
                         "enable_return_routed_experts", False),
+                warmup_handler=continue_decode_warmup,
             )

@@ -20,6 +20,11 @@
 # Exit on error, exit on unset variable, fail on pipe errors.
 set -euo pipefail
 
+# Centrally default to using prebuilt image when running in Buildkite CI
+if [ -n "${BUILDKITE:-}" ]; then
+  export USE_PREBUILT_IMAGE="${USE_PREBUILT_IMAGE:-1}"
+fi
+
 if [ "$#" -eq 0 ]; then
   echo "ERROR: Usage: $0 <command_and_args_to_run_in_docker...>"
   exit 1
@@ -55,6 +60,7 @@ ENV_VARS=(
   -e USE_BATCHED_RPA_KERNEL="${USE_BATCHED_RPA_KERNEL:-}"
   -e GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
   -e HOST_NAME="${HOST_NAME:-}"
+  -e GCS_BUCKET="${GCS_BUCKET:-}"
 )
 
 # shellcheck disable=SC1091

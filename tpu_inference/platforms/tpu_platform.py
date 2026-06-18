@@ -4,6 +4,7 @@ import os
 import random
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
+import jax
 import jax.numpy as jnp
 import numpy
 import torch
@@ -113,6 +114,10 @@ class TpuPlatform(Platform):
         "deepseek_v4_fp8"
     ]
 
+    def set_device(self, device: torch.device) -> None:
+        # No-op on TPU since JAX/libtpu handles device management internally.
+        pass
+
     additional_env_vars: list[str] = [
         "PHASED_PROFILING_DIR",
         "TPU_CHIPS_PER_HOST_BOUNDS",
@@ -173,6 +178,24 @@ class TpuPlatform(Platform):
                 "Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.")
             return torch.float8_e5m2
         return torch.float8_e4m3fn
+
+    @classmethod
+    def mem_get_info(cls) -> Tuple[int, int]:
+        """
+        Returns (free_memory, total_memory) in bytes for the specified TPU device.
+        """
+        # Fetch TPU memory statistics via JAX
+        # On TPU SPMD, we need to aggregate both the limit and usage across all
+        # local devices because global tensor dimensions are used for budget calculations.
+        total_memory = 0
+        bytes_in_use = 0
+        for d in jax.local_devices():
+            stats = d.memory_stats()
+            total_memory += stats.get('bytes_limit', 0)
+            bytes_in_use += stats.get('bytes_in_use', 0)
+
+        free_memory = total_memory - bytes_in_use
+        return free_memory, total_memory
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
@@ -304,11 +327,21 @@ class TpuPlatform(Platform):
                     MultiprocExecutor
                 parallel_config.distributed_executor_backend = MultiprocExecutor
         elif multihost_backend == "ray":
-            from tpu_inference.executors.ray_distributed_executor import \
-                RayDistributedExecutor
-            parallel_config.distributed_executor_backend = RayDistributedExecutor
-            logger.info(
-                "Force using RayDistributedExecutor for JAX on multihost.")
+            # Check if we should use Ray Executor V2 (V1-multiproc compatible)
+            use_v2 = os.getenv("TPU_RAY_EXECUTOR_V2", "0") == "1"
+            if use_v2:
+                from tpu_inference.executors.ray_distributed_executor_v2 import \
+                    RayDistributedExecutorV2
+                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+                logger.info(
+                    "Force using RayDistributedExecutorV2 for JAX on multihost."
+                )
+            else:
+                from tpu_inference.executors.ray_distributed_executor import \
+                    RayDistributedExecutor
+                parallel_config.distributed_executor_backend = RayDistributedExecutor
+                logger.info(
+                    "Force using RayDistributedExecutor for JAX on multihost.")
         else:
             logger.warning(
                 f"Unknown TPU multihost backend: {multihost_backend}. "
