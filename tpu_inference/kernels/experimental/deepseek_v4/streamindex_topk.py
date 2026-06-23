@@ -347,11 +347,11 @@ def _streamindex_topk_kernel(
         # Quantized FP8 index cache path: unpack keys and scale factors locally.
         flat_bkv = bkv.reshape(-1, bkv.shape[-1])
         fp8_val = flat_bkv[:, :head_dim]
-        fp8_val = jax.lax.bitcast_convert_type(fp8_val, jnp.float8_e4m3fn)
+        fp8_val = pltpu.bitcast(fp8_val, jnp.float8_e4m3fn)
 
         scale_val = flat_bkv[:, head_dim:head_dim + 1]
-        scale_val = jax.lax.bitcast_convert_type(
-            scale_val, jnp.float8_e8m0fnu).astype(jnp.float32)
+        scale_val = pltpu.bitcast(scale_val,
+                                  jnp.float8_e8m0fnu).astype(jnp.float32)
 
         # NOTE: Do NOT multiply the scales here. Return them separately.
         return fp8_val.reshape(bkv_sz, head_dim), scale_val.reshape(bkv_sz, 1)
