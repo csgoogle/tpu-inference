@@ -61,9 +61,9 @@ from tpu_inference.layers.common.sharding import (MESH_AXIS_NAMES,
                                                   ShardingConfigManager)
 from tpu_inference.layers.jax.sample.rejection_sampler import RejectionSampler
 from tpu_inference.layers.jax.sample.sampling import (
-    PromptLogprobsAsyncData, PromptLogprobsReqSnap,
+    SAMPLING_MASK_UNSET_ID, PromptLogprobsAsyncData, PromptLogprobsReqSnap,
     _jax_logprobs_copy_to_host_async, compute_and_gather_logprobs,
-    compute_prompt_logprobs, sample)
+    compute_prompt_logprobs, compute_sampling_mask, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
@@ -376,6 +376,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                  scheduler_output: Optional["VllmSchedulerOutput"] = None,
                  req_ids_dp: Optional[Dict] = None,
                  padded_num_scheduled_tokens_per_dp_rank: int = 0,
+                 sampling_mask_ids: Optional[jax.Array] = None,
+                 sampling_mask_overflow: Optional[jax.Array] = None,
                  runner=None):
         self._model_runner_output = model_runner_output
         self._next_tokens = next_tokens
@@ -390,6 +392,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._scheduler_output = scheduler_output
         self._req_ids_dp = req_ids_dp
         self._padded_num_scheduled_tokens_per_dp_rank = padded_num_scheduled_tokens_per_dp_rank
+        self._sampling_mask_ids = sampling_mask_ids
+        self._sampling_mask_overflow = sampling_mask_overflow
         self._runner = runner
         self._is_continue_decode = False
         self._actual_steps_future = None
@@ -463,6 +467,22 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             self._model_runner_output.prompt_logprobs_dict = (
                 self._runner._get_prompt_logprobs_dict(
                     self._prompt_logprobs_async_data))
+
+        if getattr(self._runner, "return_sampling_mask", False):
+            if self._sampling_mask_ids is None:
+                raise RuntimeError(
+                    "return_sampling_mask is on but this async step carries "
+                    "no mask. Refusing to return an unmasked output: the "
+                    "trainer cannot tell it apart from a full-vocabulary "
+                    "rollout.")
+            self._model_runner_output.sampling_masks = (
+                _sampling_masks_materialize(
+                    self._sampling_mask_ids,
+                    self._sampling_mask_overflow,
+                    valid_sampled_token_ids,
+                    self.logits_indices_selector,
+                    self._num_reqs,
+                ))
 
         if self._runner.model_config.enable_return_routed_experts and self._expert_indices is not None:
             expert_indices_cpu = np.asarray(
@@ -649,6 +669,83 @@ def _jax_logprobs_materialize(
         logprobs=np.array(logprobs_arr.tolist()),
         sampled_token_ranks=np.array(selected_token_ranks.tolist()),
         cu_num_generated_tokens=cu_num_generated_tokens,
+    )
+
+
+def _sampling_masks_materialize(
+    mask_ids: jax.Array,
+    mask_overflow: jax.Array,
+    valid_sampled_token_ids: List[List[int]],
+    logits_indices_selector: Optional[List[int]],
+    num_reqs: int,
+) -> "SamplingMaskLists":
+    """Turn the device-side `[num_reqs, width]` id list into vLLM's CSR form.
+
+    The scheduler slices this per request with `slice_request(req_index, n)`,
+    where `n` is the number of tokens the request emitted this step. Requests
+    that emitted nothing (partial prefill, discarded rows) contribute no
+    entry to `offsets` but do repeat their value in `cu_num_generated_tokens`,
+    which is how the two indexings stay aligned. This mirrors what the GPU
+    producer does with `np.flatnonzero(num_sampled_tokens)`.
+    """
+    from vllm.v1.outputs import SamplingMaskLists
+
+    mask_ids_cpu = np.asarray(jax.device_get(mask_ids))
+    overflow_cpu = np.asarray(jax.device_get(mask_overflow))
+    # Map rows back to the pre-DP-shuffle request order, exactly as
+    # `host_extract_sampled_tokens` does for the tokens themselves.
+    if logits_indices_selector is not None:
+        mask_ids_cpu = mask_ids_cpu[logits_indices_selector]
+        overflow_cpu = overflow_cpu[logits_indices_selector]
+    mask_ids_cpu = mask_ids_cpu[:num_reqs]
+    overflow_cpu = overflow_cpu[:num_reqs]
+
+    kept_rows: List[np.ndarray] = []
+    num_generated = [0] * num_reqs
+    for req_idx in range(num_reqs):
+        sampled = valid_sampled_token_ids[req_idx]
+        num_generated[req_idx] = len(sampled)
+        if not sampled:
+            continue
+        if len(sampled) != 1:
+            raise RuntimeError(
+                "return_sampling_mask expects one sampled token per request "
+                f"per step, but request index {req_idx} emitted "
+                f"{len(sampled)}.")
+        if bool(overflow_cpu[req_idx]):
+            raise RuntimeError(
+                "The sampler kept more than SAMPLING_MASK_WIDTH="
+                f"{mask_ids_cpu.shape[1]} tokens for request index {req_idx}. "
+                "The mask would be a subset of the distribution actually "
+                "sampled from, so replaying it would normalise over the wrong "
+                "support. Raise SAMPLING_MASK_WIDTH well above the largest "
+                "top_k in flight -- `topk_mask` keeps every logit tied with "
+                "the k-th largest, so the kept set is routinely a little "
+                "wider than k. (A greedy request, temperature < 1e-5, keeps "
+                "the whole vocabulary and can never fit at any width.)")
+        kept = mask_ids_cpu[req_idx]
+        kept = kept[kept != SAMPLING_MASK_UNSET_ID]
+        if kept.size == 0:
+            raise RuntimeError(
+                f"Empty sampling mask for request index {req_idx}: the "
+                "sampler's support set cannot be empty, and an empty one "
+                "reads downstream as a -inf normaliser.")
+        kept_rows.append(kept)
+
+    if kept_rows:
+        token_ids = np.concatenate(kept_rows).astype(np.int32, copy=False)
+        counts = np.array([row.size for row in kept_rows], dtype=np.int64)
+    else:
+        token_ids = np.empty(0, dtype=np.int32)
+        counts = np.empty(0, dtype=np.int64)
+    offsets = np.empty(len(counts) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(counts, dtype=np.int64, out=offsets[1:])
+
+    return SamplingMaskLists(
+        token_ids=token_ids,
+        offsets=offsets,
+        cu_num_generated_tokens=np.cumsum([0] + num_generated).tolist(),
     )
 
 
@@ -865,6 +962,33 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         self.pad_token_id = runner_utils.get_pad_token_id(self.model_config)
+
+        # Per-token keep-sampling mask (vLLM `--return-sampling-mask`): ship the
+        # top-k/top-p support set the sampler drew from so a trainer can replay
+        # it. Only the plain single-token decode path produces it; the other
+        # paths refuse loudly rather than return None, because a silently
+        # absent mask is a trainer that normalises over the full vocabulary
+        # while believing it matched the sampler.
+        self.return_sampling_mask = getattr(self.model_config,
+                                            "return_sampling_mask", False)
+        self.sampling_mask_width = envs.SAMPLING_MASK_WIDTH
+        if self.return_sampling_mask:
+            if self.sampling_mask_width <= 0:
+                raise ValueError(
+                    "return_sampling_mask requires SAMPLING_MASK_WIDTH > 0, "
+                    f"got {self.sampling_mask_width}.")
+            if self.speculative_config is not None:
+                raise NotImplementedError(
+                    "return_sampling_mask is not supported with speculative "
+                    "decoding: a step emits several tokens per request but "
+                    "only one set of sampled logits, so there is no mask for "
+                    "the accepted draft positions.")
+            if self.enable_continue_decode:
+                raise NotImplementedError(
+                    "return_sampling_mask is not supported with "
+                    "enable_continue_decode: the fused decode loop keeps only "
+                    "the sampled tokens across its inner steps and never "
+                    "materializes the per-step logits the mask is read from.")
 
     def _init_random(self):
         if self.model_config.seed is None:
@@ -2009,6 +2133,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             step_rng = self.rng_params_for_sampling
 
         processed_bonus_logits = None
+        sampling_mask_ids = None
+        sampling_mask_overflow = None
         if spec_decode_metadata is None:
             logits = logits.astype(jnp.float32)
             with self.maybe_forbid_compile:
@@ -2018,6 +2144,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     logits,
                     tpu_sampling_metadata,
                 )
+            if self.return_sampling_mask:
+                # `processed_logits` still carries top-k/top-p's -1e12 fill, so
+                # this reads the sampler's support set off the very array
+                # `jax.random.categorical` normalised over -- not a
+                # reconstruction of it. `sample` has already replicated the
+                # vocab axis (see its with_sharding_constraint), so the top_k
+                # is local to each row shard and adds no collective under TP.
+                #
+                # Deliberately NOT under `maybe_forbid_compile`:
+                # `_precompile_sampling_mask` has to guess this array's
+                # sharding, and if the guess is off the only cost is one
+                # compile per num_reqs bucket at first use. Under ForbidCompile
+                # that guess would instead kill the run on its first real step.
+                sampling_mask_ids, sampling_mask_overflow = (
+                    compute_sampling_mask(processed_logits,
+                                          self.sampling_mask_width))
         else:
             if tpu_sampling_metadata.do_sampling:
                 bonus_rng, rejection_rng = jax.random.split(step_rng)
@@ -2215,6 +2357,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 req_ids_dp=req_ids_dp,
                 padded_num_scheduled_tokens_per_dp_rank=
                 padded_num_scheduled_tokens_per_dp_rank,
+                sampling_mask_ids=sampling_mask_ids,
+                sampling_mask_overflow=sampling_mask_overflow,
                 runner=self)
             return async_model_runner_output
 
@@ -2264,6 +2408,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             pooler_output=[],
             kv_connector_output=kv_connector_output,
         )
+
+        if self.return_sampling_mask:
+            if sampling_mask_ids is None:
+                raise RuntimeError(
+                    "return_sampling_mask is on but no mask was produced for "
+                    "this step. Refusing to return an unmasked output: the "
+                    "trainer cannot tell it apart from a full-vocabulary "
+                    "rollout.")
+            model_runner_output.sampling_masks = _sampling_masks_materialize(
+                sampling_mask_ids,
+                sampling_mask_overflow,
+                valid_sampled_token_ids,
+                logits_indices_selector,
+                num_reqs,
+            )
 
         if self.model_config.enable_return_routed_experts and expert_indices is not None:
             expert_indices_cpu = np.asarray(jax.device_get(expert_indices))

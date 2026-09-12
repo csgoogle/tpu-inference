@@ -32,7 +32,8 @@ from tpu_inference.layers.common.attention_metadata import (
     SharedAttentionMetadata, pcp_cache_page_buckets)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.sample.sampling import (
-    compute_and_gather_logprobs, compute_and_gather_prompt_logprobs, sample)
+    compute_and_gather_logprobs, compute_and_gather_prompt_logprobs,
+    compute_sampling_mask, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.logger import init_logger
@@ -1017,7 +1018,32 @@ class CompilationManager:
                         logprobs=logprobs,
                     )
 
+        if getattr(self.runner, "return_sampling_mask", False):
+            self._precompile_sampling_mask()
+
         self._sampling_precompiled = True
+
+    def _precompile_sampling_mask(self) -> None:
+        logger.info("Compiling sampling mask with different input shapes.")
+        hsize = self.runner.vocab_size
+        # `compute_sampling_mask` is fed `sample()`'s second return value,
+        # which inherits the `P(ATTN_DATA, None)` constraint that `sample`
+        # applies to the logits before drawing.
+        processed_logits_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, None))
+        for num_reqs in self.runner.num_reqs_paddings:
+            processed_logits = self._create_dummy_tensor(
+                (num_reqs, hsize),
+                jnp.float32,
+                sharding=processed_logits_sharding)
+            self._run_compilation(
+                f"worker{self.runner.rank} compute_sampling_mask",
+                compute_sampling_mask,
+                processed_logits,
+                call_kwargs={"width": self.runner.sampling_mask_width},
+                compile_only=False,
+                num_reqs=num_reqs,
+            )
 
     def _precompile_disagg_utils(self) -> None:
         if not is_disagg_enabled():
