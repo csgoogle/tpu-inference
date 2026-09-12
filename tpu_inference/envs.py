@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     JAX_PROFILER_SERVER_PORT: int = 9999
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
     SAMPLING_MASK_WIDTH: int = 128
+    SAMPLING_MICROBATCH_SIZE: int = 16
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -370,6 +371,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mask at all).
     "SAMPLING_MASK_WIDTH":
     lambda: int(os.getenv("SAMPLING_MASK_WIDTH") or "128"),
+    # Rows per chunk when running top-k/top-p over the batch. 0 = never chunk
+    # (the pre-2026-09 behaviour). Default 16, which is the measured optimum;
+    # `sampling.py` additionally declines to chunk outside the batch range
+    # where chunking is a win, so the default is safe to leave alone.
+    #
+    # top-k and top-p are each a 31-iteration binary search that reduces over
+    # the whole `[num_reqs, vocab]` array every iteration; together they are
+    # ~70% of `sample()` at a 262k vocab. Past a certain batch the working set
+    # stops fitting and throughput falls off a cliff -- measured on v6e at
+    # vocab 262144, `sample()` costs 1.37 ms at num_reqs=16 but 8.24 ms at
+    # num_reqs=32, 6x the time for 2x the work. Feeding the searches a fixed
+    # number of rows at a time via `lax.map` keeps them in the efficient regime
+    # (the same two fusions go 505/537 -> 953/954 GFLOP/s and 41-44% -> 64% HBM
+    # utilization), so the cost goes back to being linear in num_reqs.
+    #
+    # Sampled tokens are unchanged: only the transforms are chunked,
+    # `jax.random.categorical` still draws once from the whole batch with the
+    # original key. Verified bit-identical at num_reqs 16/32/64/128.
+    #
+    # Choosing 16: measured on v6e at vocab 262144, top_k 64 / top_p 0.95, as
+    # ms for `sample()` plus the sampling mask -- the whole post-logits path.
+    #
+    #   num_reqs |  0 (off) |  mb=8  | mb=16 | mb=32
+    #         16 |     1.73 |  2.02  |    -- |    --
+    #         32 |     8.05 |  3.78  |  3.20 |    --
+    #         64 |     8.89 |  7.24  |  6.16 | 17.88
+    #        128 |    10.06 | 13.74  | 11.50 | 35.99
+    #
+    # Chunks below 16 leave the second-minor dimension short; 32 is much worse
+    # than not chunking at all. The loss at num_reqs=128 is a property of the
+    # batch rather than of this setting, so it is handled in code -- see
+    # `_SAMPLING_MICROBATCH_MAX_NUM_REQS` in `sampling.py`.
+    #
+    # Holding mb=16 and sweeping the vocabulary, speedup over unchunked (1.00
+    # at num_reqs=128 is the cutoff above declining to chunk at all):
+    #
+    #     vocab |  32 reqs | 64 reqs | 128 reqs
+    #     32768 |    1.24x |   0.89x |    1.00x
+    #    131072 |    1.87x |   1.15x |    1.00x
+    #    262144 |    2.54x |   1.45x |    1.00x
+    #
+    # The win grows with the vocabulary, which is the point: the binary
+    # searches are what scale with it. One cell regresses -- a 32k vocabulary
+    # at num_reqs=64 pays 11% of 2.3 ms. That is left alone deliberately: the
+    # boundary is not separable by vocabulary or by total elements (32768x64
+    # loses while the same element count at 262144x32 wins 2.5x), so any guard
+    # narrow enough to catch it would be fitted to nine measurements rather
+    # than to a mechanism. Set SAMPLING_MICROBATCH_SIZE=0 on a small-vocabulary
+    # model that decodes at exactly 64 if 0.3 ms/step matters there.
+    "SAMPLING_MICROBATCH_SIZE":
+    lambda: int(os.getenv("SAMPLING_MICROBATCH_SIZE") or "16"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":

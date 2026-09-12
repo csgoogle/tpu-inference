@@ -21,6 +21,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from vllm.v1.outputs import LogprobsTensors
 
+from tpu_inference import envs
 from tpu_inference.layers.common.binary_search import topk_mask, topp_mask
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.sample.sampling_metadata import \
@@ -76,6 +77,66 @@ def _jax_logprobs_copy_to_host_async(
     )
 
 
+def _transform_rows(
+    logits: jax.Array,
+    temperature: jax.Array,
+    top_k: jax.Array,
+    top_p: jax.Array,
+) -> jax.Array:
+    """Temperature, top-k and top-p over whatever rows it is handed.
+
+    Both masks are computed unconditionally and then selected with `where`, so
+    a request with `top_k == 0` or `top_p == 1.0` costs exactly as much as one
+    that filters -- the branches are per-row data, not per-row work.
+    """
+    # Temperature scaling
+    temperatures = temperature.astype(logits.dtype)
+    temperatures = jnp.expand_dims(temperatures, axis=-1)
+    logits = logits / temperatures
+
+    # Only apply top-k masking if k > 0 for each token
+    should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
+    topk_masked = topk_mask(logits, top_k, replace_val=_MASKED_LOGIT)
+    logits = jnp.where(should_apply_topk, topk_masked, logits)
+
+    # Only apply top-p masking if p < 1.0 for each token
+    should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
+    topp_masked = topp_mask(logits, top_p, replace_val=_MASKED_LOGIT)
+    logits = jnp.where(should_apply_topp, topp_masked, logits)
+
+    return logits
+
+
+# Chunking stops paying at large batches: at num_reqs=128 the unchunked
+# reduction already amortizes well enough that the `lax.map` is a net loss
+# (10.06 -> 11.50 ms with a chunk of 16, v6e / vocab 262144), while at 32 and
+# 64 it is worth 2.5x and 1.4x. Since that ceiling is a property of the batch
+# and not of the operator's chunk size, it lives here rather than in the env
+# var -- leaving `SAMPLING_MICROBATCH_SIZE` at its default is meant to be safe
+# at every batch, not just the ones it was tuned for.
+_SAMPLING_MICROBATCH_MAX_NUM_REQS = 128
+
+
+def _sampling_microbatch_size(num_reqs: int) -> Optional[int]:
+    """Rows per chunk for the transforms, or None to run the batch in one go.
+
+    Declines in four cases: the knob is off; the batch already fits in one
+    chunk, so a `lax.map` would only add a loop; the chunk does not divide the
+    batch, which would need a second padded program for the remainder; or the
+    batch is large enough that chunking is a measured loss. `num_reqs` is the
+    padded bucket, which is a power of two, so a power-of-two chunk divides
+    every bucket above it.
+    """
+    microbatch_size = envs.SAMPLING_MICROBATCH_SIZE
+    if microbatch_size <= 0 or num_reqs <= microbatch_size:
+        return None
+    if num_reqs >= _SAMPLING_MICROBATCH_MAX_NUM_REQS:
+        return None
+    if num_reqs % microbatch_size:
+        return None
+    return microbatch_size
+
+
 def _apply_sampling_transforms(
     logits: jax.Array,
     tpu_sampling_metadata: TPUSupportedSamplingMetadata,
@@ -86,6 +147,26 @@ def _apply_sampling_transforms(
     path and the processed-logprobs path so that the transformations are
     applied identically.
 
+    With `SAMPLING_MICROBATCH_SIZE` set, the batch is fed through the
+    transforms a fixed number of rows at a time instead of all at once. top-k
+    and top-p are each a 31-iteration binary search that reduces over the whole
+    `[num_reqs, vocab]` array on every iteration, and past a certain batch the
+    working set stops fitting: on v6e at a 262k vocab, `sample()` costs 1.37 ms
+    at num_reqs=16 and 8.24 ms at num_reqs=32 -- 6x the time for 2x the work.
+    Chunking holds the searches in the efficient regime (measured 41-44% ->
+    64% HBM utilization on the two reduction fusions) and makes the cost linear
+    in num_reqs again: with a chunk of 16, 2.5x at num_reqs=32 and 1.4x at 64
+    over the whole sample-plus-mask path. Outside that band it is a loss, so
+    `_sampling_microbatch_size` declines rather than chunking; see
+    `SAMPLING_MICROBATCH_SIZE` in `envs.py` for the measured table.
+
+    This is a pure throughput change. Chunking stops at the transforms;
+    `jax.random.categorical` in `sample()` still draws once over the full batch
+    from the unsplit key, so the RNG stream and every sampled token are
+    bit-identical to the unchunked path (verified at num_reqs 16/32/64/128).
+    Chunking the draw as well was measured at parity -- it buys nothing and
+    would change every token.
+
     Args:
         logits: (B, vocab_size) raw logits in float32.
         tpu_sampling_metadata: Sampling parameters (temperature, top_k, top_p).
@@ -93,24 +174,23 @@ def _apply_sampling_transforms(
     Returns:
         Processed logits with temperature, top-k, and top-p applied.
     """
-    # Temperature scaling
-    temperatures = tpu_sampling_metadata.temperature.astype(logits.dtype)
-    temperatures = jnp.expand_dims(temperatures, axis=-1)
-    logits = logits / temperatures
-
-    # Only apply top-k masking if k > 0 for each token
+    temperature = tpu_sampling_metadata.temperature
     top_k = tpu_sampling_metadata.top_k
-    should_apply_topk = jnp.expand_dims(top_k > 0, axis=-1)
-    topk_masked = topk_mask(logits, top_k, replace_val=-1e12)
-    logits = jnp.where(should_apply_topk, topk_masked, logits)
-
-    # Only apply top-p masking if p < 1.0 for each token
     top_p = tpu_sampling_metadata.top_p
-    should_apply_topp = jnp.expand_dims(top_p < 1.0, axis=-1)
-    topp_masked = topp_mask(logits, top_p, replace_val=-1e12)
-    logits = jnp.where(should_apply_topp, topp_masked, logits)
 
-    return logits
+    num_reqs, vocab_size = logits.shape
+    microbatch_size = _sampling_microbatch_size(num_reqs)
+    if microbatch_size is None:
+        return _transform_rows(logits, temperature, top_k, top_p)
+
+    num_chunks = num_reqs // microbatch_size
+    chunked = jax.lax.map(
+        lambda xs: _transform_rows(*xs),
+        (logits.reshape(num_chunks, microbatch_size, vocab_size),
+         temperature.reshape(num_chunks, microbatch_size),
+         top_k.reshape(num_chunks, microbatch_size),
+         top_p.reshape(num_chunks, microbatch_size)))
+    return chunked.reshape(num_reqs, vocab_size)
 
 
 @jax.jit(static_argnames=["mesh"])
@@ -196,13 +276,92 @@ def compute_sampling_mask(
         *subset* of the real support and replaying it would silently normalise
         over the wrong space. Callers must raise on it, not truncate.
     """
-    # width + 1 so the caller can tell "kept exactly width" from "kept more
-    # than width"; the extra column is the only way to see the overflow.
-    values, ids = jax.lax.top_k(processed_logits, width + 1)
+    block = _sampling_mask_block_size(processed_logits.shape[-1], width)
+    if block is None:
+        # Vocabulary too small (or awkwardly shaped) for the blocked form to
+        # have enough groups. A direct top_k over a few thousand entries is
+        # cheap anyway; the blocked path exists for real 128k-262k vocabs.
+        values, ids = _support_by_full_topk(processed_logits, width)
+    else:
+        values, ids = _support_by_blocks(processed_logits, width, block)
     kept = values > _MASKED_LOGIT
     mask_ids = jnp.where(kept[:, :width], ids[:, :width].astype(jnp.int32),
                          SAMPLING_MASK_UNSET_ID)
     return mask_ids, kept[:, width]
+
+
+def _sampling_mask_block_size(vocab_size: int, width: int) -> Optional[int]:
+    """Largest block that tiles `vocab_size` and leaves > `width` groups.
+
+    The blocked search needs at least `width + 1` groups (see
+    `_support_by_blocks`) and a block that divides the vocabulary exactly, so
+    that `reshape` stays a view instead of forcing a pad over the largest array
+    in the sampler. Real vocabularies are padded to a multiple of 128, so the
+    first candidate almost always wins.
+    """
+    for block in (128, 64, 32, 16, 8):
+        if vocab_size % block == 0 and vocab_size // block >= width + 1:
+            return block
+    return None
+
+
+def _support_by_full_topk(
+    processed_logits: jax.Array,
+    width: int,
+) -> tuple[jax.Array, jax.Array]:
+    # width + 1 so the caller can tell "kept exactly width" from "kept more
+    # than width"; the extra column is the only way to see the overflow.
+    return jax.lax.top_k(processed_logits, width + 1)
+
+
+def _support_by_blocks(
+    processed_logits: jax.Array,
+    width: int,
+    block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """The same `(values, ids)` a full-vocab top_k gives, ~11x cheaper.
+
+    `lax.top_k(processed_logits, width + 1)` over a 262k vocabulary costs 15.6
+    ms at num_reqs=64 on v6e -- roughly three times the entire sampler it hangs
+    off. It is answering a much harder question than we asked: we do not want
+    the vocabulary ranked, we want the <= width ids that survived top-k/top-p's
+    `_MASKED_LOGIT` fill. That is a stream compaction of a very sparse boolean,
+    and it can be done in one pass plus two tiny top_ks.
+
+    Cut the vocabulary into `groups` blocks of `block`. A survivor's block has
+    `max > _MASKED_LOGIT`, so only such blocks can contribute; take the
+    `width + 1` largest block maxima (a top_k over `groups`, 2048 rather than
+    262144), gather just those blocks, and rank inside the resulting
+    `[num_reqs, (width + 1) * block]` candidate set.
+
+    Overflow survives the shortcut. Let B be the number of blocks whose max is
+    above the fill:
+      B <= width + 1  every survivor-bearing block is selected, so the
+                      candidate set holds the support exactly.
+      B >  width + 1  each of the width + 1 selected blocks holds at least one
+                      survivor, so the candidate set holds at least width + 1
+                      of them and the (width + 1)-th value is above the fill --
+                      overflow fires, which is the right answer precisely when
+                      more than `width` ids survived.
+    Verified against the full top_k on v6e at num_reqs 8/16/32/64: identical id
+    sets and identical overflow, including the greedy full-vocabulary rows.
+    """
+    num_reqs, vocab_size = processed_logits.shape
+    blocks = processed_logits.reshape(num_reqs, vocab_size // block, block)
+
+    # One pass over the big array; everything after this is tiny.
+    block_max = jnp.max(blocks, axis=-1)
+    _, block_ids = jax.lax.top_k(block_max, width + 1)
+
+    candidates = jnp.take_along_axis(blocks, block_ids[:, :, None], axis=1)
+    candidate_ids = (block_ids[:, :, None] * block +
+                     jnp.arange(block, dtype=jnp.int32))
+
+    values, positions = jax.lax.top_k(candidates.reshape(num_reqs, -1),
+                                      width + 1)
+    ids = jnp.take_along_axis(candidate_ids.reshape(num_reqs, -1), positions,
+                              axis=1)
+    return values, ids
 
 
 def compute_logprobs(logits: jax.Array) -> jax.Array:

@@ -32,9 +32,11 @@ import numpy as np
 import pytest
 from vllm.v1.outputs import SamplingMaskLists
 
-from tpu_inference.layers.jax.sample.sampling import (SAMPLING_MASK_UNSET_ID,
-                                                      _apply_sampling_transforms,
-                                                      compute_sampling_mask)
+from tpu_inference import envs
+from tpu_inference.layers.jax.sample.sampling import (
+    SAMPLING_MASK_UNSET_ID, _apply_sampling_transforms, _sampling_mask_block_size,
+    _sampling_microbatch_size, _support_by_blocks, _support_by_full_topk,
+    compute_sampling_mask)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 from tpu_inference.runner.tpu_runner import _sampling_masks_materialize
@@ -174,6 +176,217 @@ class TestComputeSamplingMask:
         logits = jnp.asarray(np.arange(32, dtype=np.float32)[None, :])
         _, overflow = compute_sampling_mask(logits, width=8)
         assert bool(overflow[0])
+
+
+class TestBlockedSupportSearch:
+    """The blocked search must be indistinguishable from the full top_k.
+
+    `compute_sampling_mask` does not rank the vocabulary; it compacts the <=
+    width ids that survived the `_MASKED_LOGIT` fill, by taking the `width + 1`
+    highest-max blocks and ranking only inside those. That is ~11x cheaper at a
+    262k vocabulary but it is only worth having if it is exactly equivalent,
+    overflow included -- a mask that quietly drops one id makes the trainer
+    normalise over the wrong support, which is the one failure this whole
+    feature exists to prevent.
+
+    The tests above all run tiny vocabularies, which take the fallback path, so
+    without this class the blocked search is never executed.
+    """
+
+    # 2048 % 128 == 0 and 2048 // 128 = 16 > width + 1, so this really does
+    # take the blocked path rather than falling back.
+    VOCAB = 2048
+    WIDTH = 8
+
+    def _processed(self, seed, num_reqs, top_k, top_p=1.0):
+        rng = np.random.default_rng(seed)
+        logits = jnp.asarray(
+            rng.normal(size=(num_reqs, self.VOCAB)).astype(np.float32))
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.ones((num_reqs, ), dtype=jnp.float32),
+            top_k=jnp.full((num_reqs, ), top_k, dtype=jnp.int32),
+            top_p=jnp.full((num_reqs, ), top_p, dtype=jnp.float32),
+            do_sampling=True,
+        )
+        return _apply_sampling_transforms(logits, metadata)
+
+    def test_this_shape_actually_takes_the_blocked_path(self):
+        assert _sampling_mask_block_size(self.VOCAB, self.WIDTH) == 128
+        # And the real one: Gemma4's 262144 over the default width of 128.
+        assert _sampling_mask_block_size(262144, 128) == 128
+
+    def test_falls_back_when_there_are_too_few_groups(self):
+        # 6 ids cannot be cut into 5 blocks of any supported size.
+        assert _sampling_mask_block_size(6, 4) is None
+        # Divisible by 128, but 1024 // 128 = 8 groups cannot hold width + 1.
+        assert _sampling_mask_block_size(1024, 128) is None
+
+    @pytest.mark.parametrize("top_k", [1, 4, 8, 9, 64])
+    def test_matches_the_full_topk_ids_and_overflow(self, top_k):
+        processed = self._processed(seed=top_k, num_reqs=4, top_k=top_k)
+
+        ref_values, ref_ids = _support_by_full_topk(processed, self.WIDTH)
+        got_values, got_ids = _support_by_blocks(processed, self.WIDTH, 128)
+
+        ref_kept = np.asarray(ref_values) > -1e12
+        got_kept = np.asarray(got_values) > -1e12
+        # Overflow is the last column, and it is the reason for width + 1.
+        np.testing.assert_array_equal(ref_kept[:, self.WIDTH],
+                                      got_kept[:, self.WIDTH])
+        for row in range(processed.shape[0]):
+            ref_set = set(np.asarray(ref_ids)[row][ref_kept[row]].tolist())
+            got_set = set(np.asarray(got_ids)[row][got_kept[row]].tolist())
+            assert ref_set == got_set
+
+    def test_survivors_concentrated_in_one_block(self):
+        # The correctness argument turns on "at most width + 1 blocks can hold
+        # a survivor". Force the opposite extreme: every survivor inside a
+        # single block, so one selected block carries the whole support and the
+        # other width blocks are pure fill.
+        logits = np.full((1, self.VOCAB), -30.0, dtype=np.float32)
+        logits[0, 300:305] = np.arange(5, dtype=np.float32)
+        processed = _apply_sampling_transforms(
+            jnp.asarray(logits),
+            TPUSupportedSamplingMetadata(
+                temperature=jnp.ones((1, ), dtype=jnp.float32),
+                top_k=jnp.array([5], dtype=jnp.int32),
+                top_p=jnp.ones((1, ), dtype=jnp.float32),
+                do_sampling=True,
+            ))
+
+        mask_ids, overflow = compute_sampling_mask(processed, width=self.WIDTH)
+
+        assert _kept(mask_ids[0]) == {300, 301, 302, 303, 304}
+        assert not bool(overflow[0])
+
+    def test_overflow_still_fires_when_support_exceeds_width(self):
+        # More survivors than `width`, spread wide enough that more than
+        # width + 1 blocks contain one. The blocked search can only see
+        # width + 1 of those blocks, and must still report overflow rather than
+        # hand back the subset it can see.
+        logits = np.full((1, self.VOCAB), -30.0, dtype=np.float32)
+        logits[0, ::64] = 1.0  # 32 survivors, one per block, 32 blocks
+        processed = _apply_sampling_transforms(
+            jnp.asarray(logits),
+            TPUSupportedSamplingMetadata(
+                temperature=jnp.ones((1, ), dtype=jnp.float32),
+                top_k=jnp.array([32], dtype=jnp.int32),
+                top_p=jnp.ones((1, ), dtype=jnp.float32),
+                do_sampling=True,
+            ))
+
+        _, overflow = compute_sampling_mask(processed, width=self.WIDTH)
+        assert bool(overflow[0])
+
+        # Widened past the support, the same input must come back clean and
+        # complete -- 2048 // 128 = 16 groups is still > 32 + 1, so this one
+        # takes the fallback and the two paths meet on the same answer.
+        mask_ids, overflow = compute_sampling_mask(processed, width=40)
+        assert not bool(overflow[0])
+        assert _kept(mask_ids[0]) == set(range(0, self.VOCAB, 64))
+
+    def test_greedy_row_reports_overflow_on_the_blocked_path(self):
+        # Raw logits, nothing filled, so every block is live and B is the whole
+        # group count -- the B > width + 1 branch of the argument.
+        logits = jnp.asarray(
+            np.random.default_rng(0).normal(
+                size=(2, self.VOCAB)).astype(np.float32))
+        _, overflow = compute_sampling_mask(logits, width=self.WIDTH)
+        assert bool(np.all(np.asarray(overflow)))
+
+
+class TestSamplingMicrobatch:
+    """`SAMPLING_MICROBATCH_SIZE` must be a pure throughput knob.
+
+    Chunking exists because top-k and top-p each reduce over the whole
+    `[num_reqs, vocab]` array 31 times and fall off a throughput cliff once the
+    batch stops fitting. That is worth having only if it cannot be observed in
+    the output: the chunked transforms have to produce the same processed
+    logits, hence the same support set, hence the same mask, for every setting
+    that is legal -- and quietly do nothing for every setting that is not.
+    """
+
+    VOCAB = 2048
+    WIDTH = 8
+
+    def _inputs(self, num_reqs, seed=0):
+        rng = np.random.default_rng(seed)
+        logits = jnp.asarray(
+            rng.normal(size=(num_reqs, self.VOCAB)).astype(np.float32))
+        metadata = TPUSupportedSamplingMetadata(
+            temperature=jnp.asarray(rng.uniform(0.5, 1.5, num_reqs),
+                                    dtype=jnp.float32),
+            # Per-request k and p, so a chunk cannot accidentally be handed
+            # uniform parameters and pass for the wrong reason.
+            top_k=jnp.asarray(rng.integers(1, 16, num_reqs), dtype=jnp.int32),
+            top_p=jnp.asarray(rng.uniform(0.7, 1.0, num_reqs),
+                              dtype=jnp.float32),
+            do_sampling=True,
+        )
+        return logits, metadata
+
+    @pytest.mark.parametrize("num_reqs,microbatch_size", [(16, 8), (16, 4),
+                                                          (32, 8), (12, 4),
+                                                          (16, 1)])
+    def test_chunked_transforms_are_bit_identical(self, monkeypatch, num_reqs,
+                                                  microbatch_size):
+        logits, metadata = self._inputs(num_reqs)
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", 0)
+        reference = _apply_sampling_transforms(logits, metadata)
+
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", microbatch_size)
+        chunked = _apply_sampling_transforms(logits, metadata)
+
+        # Bit-identical, not merely close: the mask is read off a `>` against
+        # `_MASKED_LOGIT`, so a one-ulp drift on a boundary logit changes the
+        # support set the trainer replays.
+        assert np.array_equal(np.asarray(chunked), np.asarray(reference))
+
+    def test_mask_is_unchanged_by_chunking(self, monkeypatch):
+        logits, metadata = self._inputs(16, seed=7)
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", 0)
+        ref_ids, ref_overflow = compute_sampling_mask(
+            _apply_sampling_transforms(logits, metadata), width=self.WIDTH)
+
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", 4)
+        ids, overflow = compute_sampling_mask(
+            _apply_sampling_transforms(logits, metadata), width=self.WIDTH)
+
+        assert [_kept(r) for r in ids] == [_kept(r) for r in ref_ids]
+        assert np.array_equal(np.asarray(overflow), np.asarray(ref_overflow))
+
+    @pytest.mark.parametrize("num_reqs,microbatch_size", [
+        (16, 0),  # off
+        (16, -1),  # nonsense
+        (16, 16),  # one chunk is just the full batch with a loop around it
+        (16, 32),  # larger than the batch
+        (12, 8),  # not a divisor: the remainder would need its own program
+        (128, 16),  # at the ceiling, where chunking is a measured loss
+        (256, 16),  # and above it
+    ])
+    def test_settings_that_should_not_chunk(self, monkeypatch, num_reqs,
+                                            microbatch_size):
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", microbatch_size)
+        assert _sampling_microbatch_size(num_reqs) is None
+
+    def test_the_default_chunks_exactly_the_band_it_was_tuned_for(
+            self, monkeypatch):
+        # Resolve the declared default rather than reading the attribute, so a
+        # developer with SAMPLING_MICROBATCH_SIZE exported does not see this
+        # fail. The default being safe at *every* batch is the reason it is on
+        # rather than opt-in, so it is worth pinning.
+        monkeypatch.delenv("SAMPLING_MICROBATCH_SIZE", raising=False)
+        default = envs.environment_variables["SAMPLING_MICROBATCH_SIZE"]()
+        assert default == 16
+
+        monkeypatch.setattr(envs, "SAMPLING_MICROBATCH_SIZE", default)
+        assert _sampling_microbatch_size(32) == 16
+        assert _sampling_microbatch_size(64) == 16
+        # Below the chunk there is nothing to chunk; at and above 128 the
+        # unchunked reduction already amortizes and `lax.map` is a net loss.
+        assert _sampling_microbatch_size(16) is None
+        assert _sampling_microbatch_size(8) is None
+        assert _sampling_microbatch_size(128) is None
 
 
 class TestSamplingMasksMaterialize:
