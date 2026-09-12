@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
+    SAMPLING_MASK_WIDTH: int = 128
     USE_BATCHED_RPA_KERNEL: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
@@ -353,6 +354,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stop), so the sampled distribution is unchanged. Default 1 = stock.
     "CONTINUE_DECODE_EOS_CHECK_INTERVAL":
     lambda: int(os.getenv("CONTINUE_DECODE_EOS_CHECK_INTERVAL") or "1"),
+    # Static width of the per-token sampling mask returned when vLLM's
+    # `return_sampling_mask` is on. The mask is a fixed `[num_reqs, width]`
+    # int32 id list, so the width has to be a compile-time constant.
+    #
+    # Size it ABOVE the largest `top_k` in flight, not equal to it. `topk_mask`
+    # keeps every logit `>= the k-th largest value`, so ties at the cutoff make
+    # the kept set larger than `k` -- with bf16-valued logits over a 262k vocab
+    # that happens on roughly 3 of every 4 rows, typically by 1-2 ids and, over
+    # 20k simulated rows, never by more than 12. Doubling `top_k` is the cheap
+    # safe choice: the device array is a few hundred KB, and the wire payload
+    # is re-packed to the widest row actually observed, so unused headroom
+    # costs nothing downstream. Too small and the runner raises (it would
+    # otherwise ship a subset of the sampler's support, which is worse than no
+    # mask at all).
+    "SAMPLING_MASK_WIDTH":
+    lambda: int(os.getenv("SAMPLING_MASK_WIDTH") or "128"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
     "USE_BATCHED_RPA_SEQ_ON_LANE":

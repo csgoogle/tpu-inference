@@ -33,6 +33,17 @@ if TYPE_CHECKING:
 
 _SAMPLING_EPS = 1e-5
 
+# `_apply_sampling_transforms` writes this in place of every logit that top-k
+# or top-p removed, so "the sampler could have drawn this token" is exactly
+# "its processed logit is > _MASKED_LOGIT". Real logits never come near it.
+_MASKED_LOGIT = -1e12
+
+# Written into the slots of a `[num_reqs, width]` sampling-mask row that the
+# request did not fill. Must match `UNSET_SAMPLING_MASK_ID` on the trainer side
+# (tunix `rl/common.py`), which reads these rows back to replay the sampler's
+# support set.
+SAMPLING_MASK_UNSET_ID = -1
+
 
 @dataclass
 class PromptLogprobsReqSnap:
@@ -145,6 +156,53 @@ def sample(
     next_tokens = jax.lax.with_sharding_constraint(ret_tokens,
                                                    NamedSharding(mesh, P()))
     return next_tokens, ret_logits
+
+
+@jax.jit(static_argnames=["width"])
+def compute_sampling_mask(
+    processed_logits: jax.Array,
+    width: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Extract the token support set that `sample()` actually drew from.
+
+    `sample()` returns the post-transform logits, in which top-k and top-p have
+    replaced every rejected token with `_MASKED_LOGIT`. The surviving ids are
+    the whole of the sampler's action space: `jax.random.categorical`
+    normalises over them and nothing else. Handing that id list to a trainer
+    lets it re-normalise over the identical subspace, which is what makes the
+    importance ratio exact rather than a ratio between two different
+    normalisers.
+
+    Args:
+        processed_logits: (num_reqs, vocab_size) the second return value of
+            `sample()`. Rows that were sampled greedily hold raw logits and so
+            keep the entire vocabulary; they always report overflow.
+        width: static bound on the kept-set size. vLLM already refuses
+            `return_sampling_mask` unless every request sets `top_k > 0`, so a
+            finite bound exists -- but it is not `top_k` itself. `topk_mask`
+            thresholds (`x >= the k-th largest value`) rather than selecting
+            exactly k, so ties at the cutoff keep MORE than k; see
+            `SAMPLING_MASK_WIDTH` in `envs.py` for the measured overshoot and
+            the "size it above the largest top_k" rule. Nothing here reads
+            `top_k`: the kept set is whatever survived the `_MASKED_LOGIT`
+            fill, so per-request `top_k`, top-p narrowing and tie inflation all
+            come out right on their own.
+
+    Returns:
+        (mask_ids, overflow).
+        `mask_ids` is (num_reqs, width) int32 holding the kept ids, padded with
+        `SAMPLING_MASK_UNSET_ID`. `overflow` is (num_reqs,) bool, True where the
+        row kept strictly more than `width` ids -- i.e. where `mask_ids` is a
+        *subset* of the real support and replaying it would silently normalise
+        over the wrong space. Callers must raise on it, not truncate.
+    """
+    # width + 1 so the caller can tell "kept exactly width" from "kept more
+    # than width"; the extra column is the only way to see the overflow.
+    values, ids = jax.lax.top_k(processed_logits, width + 1)
+    kept = values > _MASKED_LOGIT
+    mask_ids = jnp.where(kept[:, :width], ids[:, :width].astype(jnp.int32),
+                         SAMPLING_MASK_UNSET_ID)
+    return mask_ids, kept[:, width]
 
 
 def compute_logprobs(logits: jax.Array) -> jax.Array:
