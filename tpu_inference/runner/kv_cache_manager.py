@@ -564,6 +564,9 @@ class KVCacheManager:
                     head_size = common_utils.get_padded_head_dim(head_size)
                     # TODO(kwang3939): Re-enable sliding_window once mixed dims with sliding_window is supported.
                     sliding_window = None
+                    if (tpu_envs.JAX_SLIDING_WINDOW_KV_CACHE
+                            and layer_type == "sliding_attention"):
+                        sliding_window = text_config.sliding_window
                     kv_cache_spec[f"layer.{i}"] = self._create_attention_spec(
                         block_size,
                         num_kv_heads,

@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     RAIDEN_H2D_SETTLE: bool = True
     GEMMA4_EARLY_GLOBAL_KV_GATHER: bool = False
     GEMMA4_REPLICATE_GLOBAL_KV_WEIGHTS: bool = False
+    JAX_SLIDING_WINDOW_KV_CACHE: bool = False
 
 
 def env_with_choices(
@@ -586,6 +587,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shard, trading additional K projection work for zero KV communication.
     "GEMMA4_REPLICATE_GLOBAL_KV_WEIGHTS":
     env_bool("GEMMA4_REPLICATE_GLOBAL_KV_WEIGHTS", default=False),
+    # Give sliding-window layers of JAX-path models a SlidingWindowSpec so vLLM
+    # frees their blocks outside the window. Layers of different shapes that
+    # vLLM packs into one KVCacheTensor then get one buffer per shape, so the
+    # worker reports available memory divided by the number of shapes.
+    "JAX_SLIDING_WINDOW_KV_CACHE":
+    env_bool("JAX_SLIDING_WINDOW_KV_CACHE"),
 }
 
 

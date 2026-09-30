@@ -553,6 +553,27 @@ class TPUWorker(WorkerBase):
                     f"  ALERT: KV offloading enabled. Deducting {stage_buffer_size_bytes} Bytes ({staging_buffer_pages} pages) from available HBM for staging buffer."
                 )
 
+        if envs.JAX_SLIDING_WINDOW_KV_CACHE:
+            # vLLM packs one layer from every KV cache group into each
+            # KVCacheTensor. When those layers differ in shape (Gemma 4:
+            # sliding 16x256 vs global 8x512 at TP=8) kv_cache_manager
+            # allocates one buffer per shape, so size the plan for that.
+            from vllm.v1.kv_cache_interface import (AttentionSpec,
+                                                    SlidingWindowSpec)
+            specs = [
+                spec for spec in self.get_kv_cache_spec().values()
+                if isinstance(spec, AttentionSpec)
+            ]
+            shapes = {(spec.num_kv_heads, spec.head_size, spec.dtype)
+                      for spec in specs}
+            if (any(isinstance(spec, SlidingWindowSpec) for spec in specs)
+                    and len(shapes) > 1):
+                total_hbm_avail //= len(shapes)
+                logger.info(
+                    "JAX_SLIDING_WINDOW_KV_CACHE: %d KV shapes share each "
+                    "tensor; reporting 1/%d of free HBM to the planner.",
+                    len(shapes), len(shapes))
+
         total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
 
         logger.info(f"Memory statistics | "
