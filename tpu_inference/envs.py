@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     RPA_V3_DECODE_BLOCK_SIZES: list[int] = []
     RPA_V3_PREFILL_BLOCK_SIZES: list[int] = []
     RPA_V3_MIXED_BLOCK_SIZES: list[int] = []
+    RPA_V3_SLIDING_DECODE_BLOCK_SIZES: list[int] = []
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -412,6 +413,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_int_list("RPA_V3_PREFILL_BLOCK_SIZES"),
     "RPA_V3_MIXED_BLOCK_SIZES":
     env_int_list("RPA_V3_MIXED_BLOCK_SIZES"),
+    # Decode block sizes for sliding-window layers only, same 4-tuple as
+    # RPA_V3_DECODE_BLOCK_SIZES. The kernel skips to the window start in whole
+    # bkv tiles, so a tile much larger than the window reads (and computes on)
+    # KV that the mask then throws away. Takes precedence over
+    # RPA_V3_DECODE_BLOCK_SIZES for those layers.
+    "RPA_V3_SLIDING_DECODE_BLOCK_SIZES":
+    env_int_list("RPA_V3_SLIDING_DECODE_BLOCK_SIZES"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
