@@ -72,9 +72,17 @@ def logprobs_use_processed_logits(logprobs_mode) -> bool:
     return logprobs_mode in PROCESSED_LOGPROBS_MODES
 
 
-def distributed_sampling_allowed(logprobs: bool, logprobs_mode) -> bool:
-    """Whether sampling can return raw logits for the requested logprob mode."""
-    return not (logprobs and logprobs_use_processed_logits(logprobs_mode))
+def distributed_sampling_allowed(logprobs: bool, logprobs_mode):
+    """Whether sampling may use distributed candidates for this logprob mode.
+
+    Returns True (raw or no logprobs), False (processed logprobs, full-vocab
+    path), or "processed" when DISTRIBUTED_PROCESSED_LOGPROBS=1: candidates are
+    used and the processed logits are rebuilt vocab-sharded from them (exact:
+    every token outside the kept top-k/top-p set is -1e12 in both paths).
+    """
+    if logprobs and logprobs_use_processed_logits(logprobs_mode):
+        return "processed" if envs.DISTRIBUTED_PROCESSED_LOGPROBS else False
+    return True
 
 
 def _can_sample_distributed(
@@ -245,7 +253,8 @@ def _distributed_topk_sample(
     temperature: jax.Array,
     top_k: jax.Array,
     top_p: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+    return_processed: bool = False,
+):
     """Samples from the exact requested global top-k using sharded candidates.
 
     Every TP shard contributes a static number of local candidates. The
@@ -312,13 +321,31 @@ def _distributed_topk_sample(
         sampled_ids = jnp.take_along_axis(candidate_ids,
                                           sampled_positions[:, None],
                                           axis=-1)[:, 0]
-        return sampled_ids, jnp.any(incomplete)
+        if not return_processed:
+            return sampled_ids, jnp.any(incomplete)
+        # This shard's slice of the full-vocab processed logits: the kept
+        # candidates (already temperature-scaled, exactly as the full-vocab
+        # transform scales them) at their ids, -1e12 everywhere else. Kept
+        # candidates owned by other shards are dropped by the scatter.
+        kept = filtered_values > -1e11
+        local_idx = candidate_ids - shard_index * local_vocab_size
+        in_shard = kept & (local_idx >= 0) & (local_idx < local_vocab_size)
+        local_idx = jnp.where(in_shard, local_idx, local_vocab_size)
+        rows = jnp.broadcast_to(
+            jnp.arange(local_logits.shape[0])[:, None], local_idx.shape)
+        local_processed = jnp.full(local_logits.shape, -1e12,
+                                   dtype=filtered_values.dtype)
+        local_processed = local_processed.at[rows, local_idx].set(
+            filtered_values, mode="drop")
+        return sampled_ids, jnp.any(incomplete), local_processed
 
+    out_specs = ((data_spec, replicated, logits_spec) if return_processed else
+                 (data_spec, replicated))
     return jax.shard_map(
         local_sample,
         mesh=mesh,
         in_specs=(replicated, logits_spec, data_spec, data_spec, data_spec),
-        out_specs=(data_spec, replicated),
+        out_specs=out_specs,
         check_vma=False,
     )(rng, logits, temperature, top_k, top_p)
 
@@ -344,6 +371,7 @@ def sample(
         ret_logits = logits
     else:
         is_greedy = tpu_sampling_metadata.temperature < _SAMPLING_EPS
+        candidate_processed = allow_distributed_sampling == "processed"
 
         def sample_full_vocab(_):
             full_logits = jax.lax.with_sharding_constraint(
@@ -355,6 +383,15 @@ def sample(
             tokens = jnp.where(is_greedy, greedy_tokens, sampled_tokens)
             output_logits = jnp.where(is_greedy[:, None], full_logits,
                                       processed_logits)
+            if candidate_processed:
+                # Match the candidate branch's vocab-sharded layout so the
+                # conditional does not gather that branch to full vocab.
+                output_logits = jax.lax.with_sharding_constraint(
+                    output_logits,
+                    NamedSharding(
+                        mesh,
+                        P(ShardingAxisName.MLP_DATA,
+                          ShardingAxisName.MLP_TENSOR)))
             return tokens, output_logits
 
         use_distributed_candidates = (allow_distributed_sampling
@@ -366,22 +403,27 @@ def sample(
             supported = _can_sample_distributed(tpu_sampling_metadata)
 
             def sample_candidates(_):
-                sampled_tokens, incomplete_candidates = (
-                    _distributed_topk_sample(
-                        rng,
-                        mesh,
-                        logits,
-                        tpu_sampling_metadata.temperature,
-                        tpu_sampling_metadata.top_k,
-                        tpu_sampling_metadata.top_p,
-                    ))
+                result = _distributed_topk_sample(
+                    rng,
+                    mesh,
+                    logits,
+                    tpu_sampling_metadata.temperature,
+                    tpu_sampling_metadata.top_k,
+                    tpu_sampling_metadata.top_p,
+                    return_processed=candidate_processed,
+                )
+                sampled_tokens, incomplete_candidates = result[:2]
 
                 def use_candidate_result(_):
                     tokens = jnp.where(is_greedy, greedy_tokens,
                                        sampled_tokens)
-                    # Processed-logit modes disable this path. Returning the
-                    # raw input supports raw logprobs without materializing
-                    # full-vocabulary filtered logits.
+                    if candidate_processed:
+                        # Same values as sample_full_vocab's output_logits,
+                        # but left vocab-sharded: no full-vocab gather/sort.
+                        return tokens, jnp.where(is_greedy[:, None], logits,
+                                                 result[2])
+                    # Raw logprobs: the raw input, no full-vocabulary
+                    # filtered logits needed.
                     return tokens, logits
 
                 return lax.cond(incomplete_candidates,

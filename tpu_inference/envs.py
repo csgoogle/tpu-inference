@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     JAX_EINSUM_FLATTEN_WEIGHT: bool = False
     ASYNC_SUBST_CACHE_INDICES: bool = False
     STEP_FN_FAST_LOOKUP: bool = False
+    DISTRIBUTED_PROCESSED_LOGPROBS: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -441,6 +442,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every step (models/common/model_loader.py:_get_step_fn).
     "STEP_FN_FAST_LOOKUP":
     env_bool("STEP_FN_FAST_LOOKUP"),
+    # Use distributed candidate sampling with processed logprobs too: the
+    # processed logits are rebuilt vocab-sharded from the kept candidates
+    # (layers/jax/sample/sampling.py), skipping the full-vocab gather and sort.
+    "DISTRIBUTED_PROCESSED_LOGPROBS":
+    env_bool("DISTRIBUTED_PROCESSED_LOGPROBS"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),

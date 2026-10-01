@@ -18,6 +18,7 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 from vllm.v1.outputs import LogprobsTensors
@@ -26,7 +27,8 @@ from tpu_inference import envs
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.sample.sampling import (
     PromptLogprobsAsyncData, PromptLogprobsReqSnap, _apply_sampling_transforms,
-    _can_sample_distributed, _merge_topk_candidates, compute_logprobs,
+    _can_sample_distributed, _merge_topk_candidates, compute_and_gather_logprobs,
+    compute_logprobs,
     compute_prompt_logprobs, distributed_sampling_allowed, gather_logprobs,
     sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
@@ -434,3 +436,58 @@ class TestComputePromptLogprobs:
         assert snap.start_idx == 0
         assert snap.num_logits == 2
         assert snap.is_last_chunk is False
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8,
+                    reason="needs 8 devices for a vocab-sharded mesh")
+def test_distributed_processed_logprobs_match_full_vocab():
+    """DISTRIBUTED_PROCESSED_LOGPROBS rebuilds the processed logits from the
+    kept candidates; they must be bit-identical to the full-vocab path."""
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+    mesh = Mesh(np.array(jax.devices()[:8]).reshape(1, 8), ("data", "model"))
+    batch, vocab = 8, 8 * 1024
+    rng = np.random.default_rng(0)
+    logits = jax.device_put(
+        jnp.asarray(rng.standard_normal((batch, vocab)).astype(np.float32) * 3),
+        NamedSharding(mesh, P("data", "model")))
+    temperature = np.ones(batch, np.float32)
+    temperature[1] = 0.0
+    top_k = np.full(batch, 64, np.int32)
+    top_k[2] = 20
+    top_p = np.full(batch, 0.95, np.float32)
+    top_p[3] = 1.0
+    metadata = TPUSupportedSamplingMetadata(
+        temperature=jnp.asarray(temperature),
+        top_k=jnp.asarray(top_k),
+        top_p=jnp.asarray(top_p),
+        _cache_collision_dummy=None,
+        do_sampling=True,
+        logprobs=True)
+    key = jax.random.PRNGKey(0)
+    with jax.set_mesh(mesh):
+        _, full = sample(key, mesh, logits, metadata,
+                         allow_distributed_sampling=False)
+        tokens, cand = sample(key, mesh, logits, metadata,
+                              allow_distributed_sampling="processed")
+        np.testing.assert_array_equal(np.asarray(full), np.asarray(cand))
+        a = compute_and_gather_logprobs(full, tokens, 20)
+        b = compute_and_gather_logprobs(cand, tokens, 20)
+    # Same logits; the log-softmax over a vocab-sharded input sums its
+    # denominator per shard, so logprobs agree to float32 rounding.
+    np.testing.assert_allclose(np.asarray(a.logprobs),
+                               np.asarray(b.logprobs),
+                               rtol=0,
+                               atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(a.logprob_token_ids),
+                                  np.asarray(b.logprob_token_ids))
+    np.testing.assert_array_equal(np.asarray(a.selected_token_ranks),
+                                  np.asarray(b.selected_token_ranks))
+
+
+def test_distributed_processed_logprobs_flag_gates_processed_mode():
+    with mock.patch.object(envs, "DISTRIBUTED_PROCESSED_LOGPROBS", True):
+        assert distributed_sampling_allowed(True,
+                                            "processed_logprobs") == "processed"
+        assert distributed_sampling_allowed(True, "raw_logprobs") is True
+    assert distributed_sampling_allowed(True, "processed_logprobs") is False
