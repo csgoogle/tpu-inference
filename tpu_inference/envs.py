@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     RPA_V3_PREFILL_BLOCK_SIZES: list[int] = []
     RPA_V3_MIXED_BLOCK_SIZES: list[int] = []
     RPA_V3_SLIDING_DECODE_BLOCK_SIZES: list[int] = []
+    RPA_SKIP_EMPTY_MIXED: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -420,6 +421,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # RPA_V3_DECODE_BLOCK_SIZES for those layers.
     "RPA_V3_SLIDING_DECODE_BLOCK_SIZES":
     env_int_list("RPA_V3_SLIDING_DECODE_BLOCK_SIZES"),
+    # Skip the RPA v3 mixed-case kernel launch when a step has no mixed
+    # sequences (pure decode): otherwise every layer pays its fixed launch cost.
+    "RPA_SKIP_EMPTY_MIXED":
+    env_bool("RPA_SKIP_EMPTY_MIXED"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),

@@ -517,6 +517,8 @@ def sharded_ragged_paged_attention(
                 # RPA_V3_*_BLOCK_SIZES are v3-kernel knobs; the experimental
                 # batched kernel takes its own BlockSizes configs instead.
                 kwargs.update(rpa_block_size_kwargs())
+                if envs.RPA_SKIP_EMPTY_MIXED:
+                    kwargs["skip_empty_mixed"] = True
                 if (attention_chunk_size is not None
                         and envs.RPA_V3_SLIDING_DECODE_BLOCK_SIZES):
                     kwargs["d_block_sizes"] = tuple(

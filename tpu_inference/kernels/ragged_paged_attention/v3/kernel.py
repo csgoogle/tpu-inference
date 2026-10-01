@@ -1581,6 +1581,7 @@ def get_default_block_sizes(
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
+        "skip_empty_mixed",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -1624,6 +1625,7 @@ def ragged_paged_attention(
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
+    skip_empty_mixed: bool = False,
 ):
     """Ragged paged attention that supports mixed prefill and decode.
 
@@ -1919,14 +1921,24 @@ def ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
         )
-    # Mixed
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
+    # Mixed. Skipped when the batch has no mixed sequences (distribution[1:3]
+    # is the mixed range): in pure decode the launch still costs its fixed
+    # setup once per layer per step, ~8us x every layer on v7x.
+    def _run_mixed(q, kv_cache):
+        return run_rpa_kernel(
+            q,
+            kv_cache,
+            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+            static_q_len=None,
+            case=RpaCase.MIXED,
+        )
+
+    if skip_empty_mixed:
+        q, kv_cache = lax.cond(distribution[2] > distribution[1], _run_mixed,
+                               lambda q, kv_cache: (q, kv_cache), q,
+                               kv_cache)
+    else:
+        q, kv_cache = _run_mixed(q, kv_cache)
 
     return (
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
