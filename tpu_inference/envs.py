@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     RPA_V3_MIXED_BLOCK_SIZES: list[int] = []
     RPA_V3_SLIDING_DECODE_BLOCK_SIZES: list[int] = []
     RPA_SKIP_EMPTY_MIXED: bool = False
+    JAX_EINSUM_FLATTEN_WEIGHT: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -425,6 +426,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sequences (pure decode): otherwise every layer pays its fixed launch cost.
     "RPA_SKIP_EMPTY_MIXED":
     env_bool("RPA_SKIP_EMPTY_MIXED"),
+    # Run "TD,DKH->TKH" projections as a 2-D matmul on the flattened weight
+    # (see quantization/unquantized.py:_einsum_maybe_flat).
+    "JAX_EINSUM_FLATTEN_WEIGHT":
+    env_bool("JAX_EINSUM_FLATTEN_WEIGHT"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),

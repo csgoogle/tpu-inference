@@ -17,10 +17,32 @@ from typing import Optional, Sequence
 import jax
 from jax import numpy as jnp
 
+from tpu_inference import envs
 from tpu_inference.layers.common.linear import sharded_matmul
 from tpu_inference.layers.common.quantization.configs import QuantLinearConfig
 from tpu_inference.layers.common.utils import \
     slice_sharded_tensor_for_concatenation
+
+
+def _einsum_maybe_flat(einsum_str: str, x: jax.Array,
+                       w: jax.Array) -> jax.Array:
+    """jnp.einsum, or the same contraction as a 2-D matmul.
+
+    With JAX_EINSUM_FLATTEN_WEIGHT=1, "TD,DKH->TKH"-shaped projections (2-D
+    activations, weight contracted over its leading dim) run as
+    x @ w.reshape(D, K*H). The reshape is contiguous and keeps the head
+    sharding. At decode-sized T, XLA lowers the 3-D-weight einsum to a VPU
+    multiply-reduce fusion instead of an MXU matmul (Gemma 4 31B on v7x at
+    batch 8: ~1.3 TB/s vs ~3.1 TB/s for the MLP's 2-D matmuls).
+    """
+    if envs.JAX_EINSUM_FLATTEN_WEIGHT and w.ndim == 3 and x.ndim == 2:
+        lhs_rhs, out = einsum_str.replace(" ", "").split("->")
+        lhs, rhs = lhs_rhs.split(",")
+        if (len(lhs) == 2 and len(rhs) == 3 and rhs[0] == lhs[1]
+                and out == lhs[0] + rhs[1:]):
+            y = jnp.dot(x, w.reshape(w.shape[0], -1))
+            return y.reshape(x.shape[0], *w.shape[1:])
+    return jnp.einsum(einsum_str, x, w)
 
 
 class UnquantizedLinearMethod:
@@ -54,7 +76,7 @@ class UnquantizedLinearMethod:
         if einsum_str:
             assert not self.linear_config.defer_all_reduce, \
                 "Defer all-reduce is not compatible with custom einsum strings."
-            outs = jnp.einsum(einsum_str, x_jax, weight_jax)
+            outs = _einsum_maybe_flat(einsum_str, x_jax, weight_jax)
         else:
             assert weight_jax.ndim == 2, "Weight must be 2D for sharded_matmul."
             outs = sharded_matmul(
