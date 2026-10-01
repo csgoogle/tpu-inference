@@ -402,7 +402,20 @@ def get_flax_model(
     # path in `models/vllm/vllm_model_wrapper.py`.
     _step_fns: Dict[Tuple[bool, Any], Any] = {}
 
+    _fast_step_fns: Dict[Any, Any] = {}
+
     def _get_step_fn(kv_caches, with_options: bool):
+        # STEP_FN_FAST_LOOKUP: the KV caches' shardings are fixed after init,
+        # so skip re-deriving and hashing every cache's NamedSharding per step
+        # (~0.5 ms of host time per decode step on Gemma 4 31B, v7x TP=8).
+        fast_key = None
+        if envs.STEP_FN_FAST_LOOKUP:
+            leaves = jax.tree.leaves(kv_caches)
+            fast_key = (with_options, len(leaves),
+                        bool(leaves) and isinstance(leaves[0], jax.core.Tracer))
+            fn = _fast_step_fns.get(fast_key)
+            if fn is not None:
+                return fn
         shardings = _kv_cache_out_shardings(kv_caches)
         key = (with_options, tuple(jax.tree.leaves(shardings)))
         fn = _step_fns.get(key)
@@ -412,6 +425,8 @@ def get_flax_model(
             } if with_options else {})
             fn = _wrap_with_jit(run_model_impl, shardings, **options)
             _step_fns[key] = fn
+        if fast_key is not None:
+            _fast_step_fns[fast_key] = fn
         return fn
 
     _draft_step_fns: Dict[Any, Any] = {}

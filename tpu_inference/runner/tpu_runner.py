@@ -558,8 +558,7 @@ class ExecuteModelState:
     padded_num_scheduled_tokens_per_dp_rank: int = 0
 
 
-@jax.jit(donate_argnums=(0, 1, 2))
-def _substitute_placeholder_token(
+def _substitute_placeholder_token_impl(
         input_ids: jax.Array, token_in_tpu_cur_input_indices: jax.Array,
         token_in_tpu_pre_next_tokens_indices: jax.Array,
         next_tokens: jax.Array, placeholder_num: int):
@@ -592,6 +591,15 @@ def _substitute_placeholder_token(
     update_values = jnp.where(mask, new_token_values, original_values)
 
     return input_ids.at[token_in_tpu_cur_input_indices].set(update_values)
+
+
+_substitute_placeholder_token = jax.jit(_substitute_placeholder_token_impl,
+                                        donate_argnums=(0, 1, 2))
+# Same computation, but the index arrays survive the call so they can be cached
+# across steps (ASYNC_SUBST_CACHE_INDICES): in steady decode they are identical
+# every step, and copying them host->device is a synchronous transfer per step.
+_substitute_placeholder_token_keep_indices = jax.jit(
+    _substitute_placeholder_token_impl, donate_argnums=(0, ))
 
 
 @jax.jit(donate_argnums=(0, 1))
@@ -2646,6 +2654,36 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if len(token_in_tpu_cur_input_indices) == 0:
             return input
 
+        cache_key = None
+        if envs.ASYNC_SUBST_CACHE_INDICES:
+            cache_key = (len(input),
+                         np.asarray(token_in_tpu_cur_input_indices,
+                                    dtype=np.int32).tobytes(),
+                         np.asarray(token_in_tpu_pre_next_tokens_indices,
+                                    dtype=np.int32).tobytes())
+            cache = self.__dict__.setdefault("_subst_index_cache", {})
+            cached = cache.get(cache_key)
+        else:
+            cached = None
+
+        if cached is None:
+            cached = self._build_subst_index_arrays(
+                input, token_in_tpu_cur_input_indices,
+                token_in_tpu_pre_next_tokens_indices)
+            if cache_key is not None:
+                if len(cache) >= 256:
+                    cache.clear()
+                cache[cache_key] = cached
+        (padded_token_in_tpu_cur_input_indices,
+         padded_token_in_tpu_pre_next_tokens_indices,
+         placeholder_num) = cached
+        return self._finish_async_token_substitution(
+            input, next_tokens_in_tpu, padded_token_in_tpu_cur_input_indices,
+            padded_token_in_tpu_pre_next_tokens_indices, placeholder_num,
+            keep_indices=cache_key is not None)
+
+    def _build_subst_index_arrays(self, input, token_in_tpu_cur_input_indices,
+                                  token_in_tpu_pre_next_tokens_indices):
         idx_pad_len = len(input) - len(token_in_tpu_cur_input_indices)
 
         # Pad according to the instructions written inside self._substitute_placeholder_token_fn
@@ -2668,6 +2706,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
              self.mesh,
              (padded_token_in_tpu_cur_input_indices,
               padded_token_in_tpu_pre_next_tokens_indices, placeholder_num))
+        return (padded_token_in_tpu_cur_input_indices,
+                padded_token_in_tpu_pre_next_tokens_indices, placeholder_num)
+
+    def _finish_async_token_substitution(
+            self, input, next_tokens_in_tpu,
+            padded_token_in_tpu_cur_input_indices,
+            padded_token_in_tpu_pre_next_tokens_indices, placeholder_num,
+            keep_indices: bool = False):
 
         if self.mesh.__class__.__name__ in ("MagicMock", "Mock"):
             next_tokens_sharding = None
@@ -2682,6 +2728,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                           next_tokens_in_tpu,
                                           sharding=next_tokens_sharding)
 
+        if keep_indices:
+            return _substitute_placeholder_token_keep_indices(
+                input, padded_token_in_tpu_cur_input_indices,
+                padded_token_in_tpu_pre_next_tokens_indices,
+                next_tokens_in_tpu, placeholder_num)
         with self.maybe_forbid_compile:
             input = self._substitute_placeholder_token_fn(
                 input, padded_token_in_tpu_cur_input_indices,

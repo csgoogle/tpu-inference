@@ -60,6 +60,8 @@ if TYPE_CHECKING:
     RPA_V3_SLIDING_DECODE_BLOCK_SIZES: list[int] = []
     RPA_SKIP_EMPTY_MIXED: bool = False
     JAX_EINSUM_FLATTEN_WEIGHT: bool = False
+    ASYNC_SUBST_CACHE_INDICES: bool = False
+    STEP_FN_FAST_LOOKUP: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -430,6 +432,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (see quantization/unquantized.py:_einsum_maybe_flat).
     "JAX_EINSUM_FLATTEN_WEIGHT":
     env_bool("JAX_EINSUM_FLATTEN_WEIGHT"),
+    # Cache the async token-substitution index arrays on device across steps
+    # (tpu_runner._apply_async_token_substitution) instead of a synchronous
+    # host->device copy of each one every step.
+    "ASYNC_SUBST_CACHE_INDICES":
+    env_bool("ASYNC_SUBST_CACHE_INDICES"),
+    # Reuse the model step jit without re-deriving the KV cache shardings
+    # every step (models/common/model_loader.py:_get_step_fn).
+    "STEP_FN_FAST_LOOKUP":
+    env_bool("STEP_FN_FAST_LOOKUP"),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
