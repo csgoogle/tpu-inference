@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     JAX_EINSUM_FLATTEN_WEIGHT: bool = False
     ASYNC_SUBST_CACHE_INDICES: bool = False
     STEP_FN_FAST_LOOKUP: bool = False
+    SAMPLING_METADATA_CACHE: bool = False
     DISTRIBUTED_PROCESSED_LOGPROBS: bool = False
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
@@ -442,6 +443,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every step (models/common/model_loader.py:_get_step_fn).
     "STEP_FN_FAST_LOOKUP":
     env_bool("STEP_FN_FAST_LOOKUP"),
+    # Reuse the sampling-parameter device arrays across steps while the batch's
+    # temperature/top_k/top_p are unchanged (sampling_metadata.from_input_batch)
+    # instead of four host->device copies every step.
+    "SAMPLING_METADATA_CACHE":
+    env_bool("SAMPLING_METADATA_CACHE"),
     # Use distributed candidate sampling with processed logprobs too: the
     # processed logits are rebuilt vocab-sharded from the kept candidates
     # (layers/jax/sample/sampling.py), skipping the full-vocab gather and sort.

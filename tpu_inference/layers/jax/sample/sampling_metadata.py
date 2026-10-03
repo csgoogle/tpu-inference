@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
+from tpu_inference import envs
 from tpu_inference.runner.input_batch import InputBatch
 from tpu_inference.utils import device_array
 
@@ -29,6 +30,22 @@ DEFAULT_SAMPLING_PARAMS = dict(
     top_k=0,
     top_p=1.0,
 )
+
+# SAMPLING_METADATA_CACHE: device arrays keyed by their host bytes. None of the
+# sampling jits donate these, so one copy can serve every step that reuses it.
+_DEVICE_CACHE: dict = {}
+
+
+def _cached_device_array(mesh: Mesh, host: np.ndarray, sharding) -> jax.Array:
+    if not envs.SAMPLING_METADATA_CACHE:
+        return device_array(mesh, host, sharding=sharding)
+    key = (id(mesh), sharding, host.dtype.str, host.shape, host.tobytes())
+    out = _DEVICE_CACHE.get(key)
+    if out is None:
+        if len(_DEVICE_CACHE) >= 256:
+            _DEVICE_CACHE.clear()
+        out = _DEVICE_CACHE[key] = device_array(mesh, host, sharding=sharding)
+    return out
 
 
 @functools.partial(
@@ -66,7 +83,7 @@ class TPUSupportedSamplingMetadata:
         dummy_shape = (1 if needs_logprobs else 2, )
         cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
         # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(
+        cache_collision_dummy = _cached_device_array(
             mesh,
             cache_collision_dummy,
             sharding=jax.sharding.NamedSharding(mesh,
@@ -104,15 +121,15 @@ class TPUSupportedSamplingMetadata:
 
         # Slice persistent device tensors to a fixed pre-compiled padded shape.
         return cls(
-            temperature=device_array(mesh,
-                                     temp_tensor[:padded_num_reqs],
-                                     sharding=sharding),
-            top_p=device_array(mesh,
-                               top_p_tensor[:padded_num_reqs],
-                               sharding=sharding),
-            top_k=device_array(mesh,
-                               top_k_tensor[:padded_num_reqs],
-                               sharding=sharding),
+            temperature=_cached_device_array(mesh,
+                                             temp_tensor[:padded_num_reqs],
+                                             sharding=sharding),
+            top_p=_cached_device_array(mesh,
+                                       top_p_tensor[:padded_num_reqs],
+                                       sharding=sharding),
+            top_k=_cached_device_array(mesh,
+                                       top_k_tensor[:padded_num_reqs],
+                                       sharding=sharding),
             _cache_collision_dummy=cache_collision_dummy,
             do_sampling=not input_batch.all_greedy,
             logprobs=needs_logprobs,
