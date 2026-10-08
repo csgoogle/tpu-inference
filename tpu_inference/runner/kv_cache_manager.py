@@ -129,22 +129,28 @@ class KVCacheManager:
             page_size_bytes = get_attention_page_size_bytes(
                 self.runner.mesh, block_size, num_kv_heads, head_size,
                 self.runner.kv_cache_dtype, False)
-            page_size_padded = (self._hybrid_uniform_page_size_bytes
-                                if self._hybrid_uniform_page_size_bytes
-                                is not None else int(page_size_bytes))
             if sliding_window is not None:
-                return SlidingWindowSpec(block_size=block_size,
+                spec = SlidingWindowSpec(block_size=block_size,
                                          num_kv_heads=num_kv_heads,
                                          head_size=head_size,
                                          dtype=self.runner.kv_cache_dtype,
-                                         sliding_window=sliding_window,
-                                         page_size_padded=page_size_padded)
+                                         sliding_window=sliding_window)
             else:
-                return FullAttentionSpec(block_size=block_size,
+                spec = FullAttentionSpec(block_size=block_size,
                                          num_kv_heads=num_kv_heads,
                                          head_size=head_size,
-                                         dtype=self.runner.kv_cache_dtype,
-                                         page_size_padded=page_size_padded)
+                                         dtype=self.runner.kv_cache_dtype)
+            # Pad only when the TPU page differs from vLLM's natural size. A
+            # padded spec breaks vLLM's page-size unification across groups of
+            # different shapes (e.g. sliding vs global KV at TP=4), which
+            # scales block_size and needs page_size_padded to scale with it.
+            if self._hybrid_uniform_page_size_bytes is not None:
+                spec = dataclasses.replace(spec,
+                               page_size_padded=self.
+                               _hybrid_uniform_page_size_bytes)
+            elif spec.page_size_bytes != int(page_size_bytes):
+                spec = dataclasses.replace(spec, page_size_padded=int(page_size_bytes))
+            return spec
 
     def update_mamba_page_size_padded(
             self, layers: dict[str, AttentionLayerBase]) -> None:

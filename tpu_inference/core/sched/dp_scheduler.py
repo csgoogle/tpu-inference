@@ -182,7 +182,12 @@ def _scheduler_worker_process(
         "include_finished_set": include_finished_set,
         "log_stats": log_stats,
     }
-    if "hash_block_size" in sig.parameters:
+    # AsyncScheduler.__init__ is (*args, **kwargs), so also forward through
+    # **kwargs. Dropping it falls back to block_size (the LCM across groups),
+    # which hybrid groups with smaller blocks cannot divide.
+    if "hash_block_size" in sig.parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()):
         scheduler_kwargs["hash_block_size"] = hash_block_size
 
     import os
